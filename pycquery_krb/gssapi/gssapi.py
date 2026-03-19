@@ -339,26 +339,56 @@ class GSSAPI_AES:
 		m.checksum = checksum_profile.checksum(self.session_key, KG_USAGE.INITIATOR_SIGN.value, data + m.to_bytes()[:16])
 		
 		return m.to_bytes()
+	
+	def GSS_WrapNoConf(self, data, seq_num):
+		"""Wrap token without confidentiality (RFC 4752: conf_flag FALSE). Token = 16-byte header + plaintext + 12-byte HMAC."""
+		checksum_profile = self.checksum_profile
+		chk_len = checksum_profile.macsize
+		t = GSSWrapToken()
+		t.Flags = FlagsField(0)  # no Sealed
+		t.EC = chk_len
+		t.RRC = 0
+		t.SND_SEQ = seq_num
+		token_header = t.to_bytes()
+		# Java CipherHelper.calculateChecksum builds buf as data first, then header (buf[0:len]=data, buf[len:]=header)
+		header_for_checksum = bytearray(token_header)
+		header_for_checksum[4:8] = b'\x00\x00\x00\x00'  # clear EC,RRC for checksum (MessageToken_v2)
+		to_checksum = data + bytes(header_for_checksum)
+		cksum = checksum_profile.checksum(
+			self.session_key, KG_USAGE.INITIATOR_SEAL.value, to_checksum
+		)
+		return token_header + data + cksum
 		
-	def GSS_Wrap(self, data, seq_num):
+	def GSS_Wrap(self, data, seq_num, security_layer_response=False):
 		cipher = self.cipher_type()
 		pad = (cipher.blocksize - (len(data) % cipher.blocksize)) & 15
 		padStr = b'\xFF' * pad
 		data += padStr
 		
 		t = GSSWrapToken()
-		t.Flags = FlagsField.Sealed | FlagsField.AcceptorSubkey
-		t.EC = pad
-		t.RRC = 0
+		t.Flags = FlagsField.Sealed if security_layer_response else (FlagsField.Sealed | FlagsField.AcceptorSubkey)
 		t.SND_SEQ = seq_num
 		
-		cipher_text = cipher.encrypt(self.session_key, KG_USAGE.INITIATOR_SEAL.value,  data + t.to_bytes(), None)
-		t.RRC = 28 #[RFC4121] section 4.2.5
-		cipher_text = self.rotate(cipher_text, t.RRC + t.EC)
+		if security_layer_response:
+			# Java WrapToken_v2 format: EC=0, RRC=0, no rotation (MessageToken_v2 lines 378-382)
+			t.EC = 0
+			t.RRC = 0
+		else:
+			t.EC = pad
+			t.RRC = 0  # set to 28 after encrypt for RFC 4121 rotation
 		
+		cipher_text = cipher.encrypt(self.session_key, KG_USAGE.INITIATOR_SEAL.value,  data + t.to_bytes(), None)
+		
+		if security_layer_response:
+			# Token = header (16) + raw cipher; no rotation so Java decrypt works
+			ret1 = cipher_text[16:]
+			ret2 = t.to_bytes() + cipher_text[:16]
+			return ret1, ret2
+		
+		t.RRC = 28  # [RFC4121] section 4.2.5
+		cipher_text = self.rotate(cipher_text, t.RRC + t.EC)
 		ret1 = cipher_text[16 + t.RRC + t.EC:]
 		ret2 = t.to_bytes() + cipher_text[:16 + t.RRC + t.EC]
-		
 		return ret1, ret2
 		
 	def GSS_Unwrap(self, data, seq_num, direction='init', auth_data = None):

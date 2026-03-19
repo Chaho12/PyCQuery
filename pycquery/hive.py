@@ -11,12 +11,12 @@ from __future__ import unicode_literals
 import atexit
 import copy
 import datetime
+import io
+import os
 import random
 import re
+import struct
 import threading
-import configparser
-import os
-import io
 
 from decimal import Decimal
 
@@ -40,6 +40,7 @@ import thrift.protocol.TBinaryProtocol
 import thrift.transport.THttpClient
 import thrift.transport.TSocket
 import thrift.transport.TTransport
+from thrift.transport.TTransport import TTransportBase, CReadableTransport
 
 from pycquery_krb.common.creds import KerberosCredential
 from pycquery_krb.common.target import KerberosTarget
@@ -47,7 +48,10 @@ from pycquery_krb.common.constants import KerberosSocketType
 from pycquery_krb.client import KerbrosClient
 from pycquery_krb.common.ccache import CCACHE
 from pycquery_krb.common.spn import KerberosSPN
-from pycquery_krb.protocol.structures import KRB5Token
+from pycquery_krb.protocol.asn1_structs import GSSAPIOID, GSSAPIToken
+from pycquery_krb.protocol.structures import KRB5Token, KRB5TokenTokID
+from pycquery_krb.gssapi.gssapi import get_gssapi
+from pycquery_krb.gssapi.gssapi import GSSWrapToken
 
 # PEP 249 module globals
 apilevel = '2.0'
@@ -122,6 +126,159 @@ def connect(*args, **kwargs):
     return Connection(*args, **kwargs)
 
 
+class TKerberosSaslTransport(TTransportBase, CReadableTransport):
+    """Thrift SASL transport for GSSAPI/Kerberos using pycquery_krb (pure Python).
+
+    Performs the same SASL handshake as thrift_sasl.TSaslClientTransport with
+    mechanism "GSSAPI". After handshake, frames are sent as 4-byte length (big-endian)
+    + payload (QOP=auth, no encryption).
+    """
+
+    START = 1
+    OK = 2
+    BAD = 3
+    ERROR = 4
+    COMPLETE = 5
+
+    def __init__(self, trans, kerberos_token_factory):
+        """Initialize.
+
+        :param trans: Underlying transport (e.g. TBufferedTransport over TSocket).
+        :param kerberos_token_factory: Callable(payload: Optional[bytes]) -> bytes.
+            When payload is None, returns the initial GSSAPI token (AP-REQ). When
+            payload is a server challenge, returns the client response (e.g. empty
+            for AP-REP, or 4 octets for RFC 4752 security layer).
+        """
+        self._trans = trans
+        self._token_factory = kerberos_token_factory
+        self._wbuf = io.BytesIO()
+        self._rbuf = io.BytesIO()
+        self._opened = False
+
+    def isOpen(self):
+        try:
+            return self._trans.isOpen()
+        except AttributeError:
+            return self._trans.is_open()
+
+    def open(self):
+        if not self.isOpen():
+            self._trans.open()
+
+        if self._opened:
+            raise thrift.transport.TTransport.TTransportException(
+                type=thrift.transport.TTransport.TTransportException.NOT_OPEN,
+                message="Already open")
+
+        initial_token = self._token_factory(None)
+        if not isinstance(initial_token, bytes):
+            initial_token = initial_token.encode('latin-1')
+
+        self._send_message(self.START, b"GSSAPI")
+        self._send_message(self.OK, initial_token)
+
+        challenge_idx = 0
+        while True:
+            status, payload = self._recv_sasl_message()
+            if status not in (self.OK, self.COMPLETE):
+                raise thrift.transport.TTransport.TTransportException(
+                    type=thrift.transport.TTransport.TTransportException.NOT_OPEN,
+                    message="Bad SASL status: %d (%s)" % (status, payload))
+            if status == self.COMPLETE:
+                break
+            challenge_idx += 1
+            reply = self._token_factory(payload)
+            send_complete = False
+            if isinstance(reply, tuple) and len(reply) == 2:
+                reply, send_complete = reply[0], reply[1]
+            if reply is None:
+                reply = b""
+            if not isinstance(reply, bytes):
+                reply = reply.encode('latin-1')
+            _logger.debug(
+                "SASL challenge #%d: payload_len=%d payload_head=%s reply_len=%d",
+                challenge_idx,
+                len(payload),
+                payload[:32].hex() if len(payload) >= 32 else payload.hex(),
+                len(reply),
+            )
+            if send_complete:
+                self._send_message(self.COMPLETE, reply)
+                status, msg = self._recv_sasl_message()
+                if status not in (self.OK, self.COMPLETE):
+                    raise thrift.transport.TTransport.TTransportException(
+                        type=thrift.transport.TTransport.TTransportException.NOT_OPEN,
+                        message="Bad SASL status: %d (%s)" % (status, msg))
+                break
+            self._send_message(self.OK, reply)
+
+        self._opened = True
+
+    def _send_message(self, status, body):
+        header = struct.pack(">BI", status, len(body))
+        self._trans.write(header + body)
+        self._trans.flush()
+
+    def _recv_sasl_message(self):
+        header = self._trans_read_all(5)
+        status, length = struct.unpack(">BI", header)
+        payload = self._trans_read_all(length) if length > 0 else b""
+        return status, payload
+
+    def write(self, data):
+        self._wbuf.write(data)
+
+    def flush(self):
+        buffer = self._wbuf.getvalue()
+        self._trans.write(struct.pack(">I", len(buffer)) + buffer)
+        self._trans.flush()
+        self._wbuf = io.BytesIO()
+
+    def read(self, sz):
+        data = self._rbuf.read(sz)
+        if len(data) == sz:
+            return data
+        self._read_frame()
+        return data + self._rbuf.read(sz - len(data))
+
+    def _read_frame(self):
+        header = self._trans_read_all(4)
+        (length,) = struct.unpack(">I", header)
+        payload = self._trans_read_all(length)
+        self._rbuf = io.BytesIO(payload)
+
+    def _trans_read_all(self, sz):
+        try:
+            read_all = self._trans.readAll
+        except AttributeError:
+            def read_all(n):
+                buf = b""
+                while len(buf) < n:
+                    chunk = self._trans.read(n - len(buf))
+                    if not chunk:
+                        raise thrift.transport.TTransport.TTransportException(
+                            type=thrift.transport.TTransport.TTransportException.END_OF_FILE,
+                            message="End of file reading from transport")
+                    buf += chunk
+                return buf
+        return read_all(sz)
+
+    def close(self):
+        self._trans.close()
+        self._opened = False
+
+    @property
+    def cstringio_buf(self):
+        return self._rbuf
+
+    def cstringio_refill(self, prefix, reqlen):
+        while len(prefix) < reqlen:
+            self._read_frame()
+            prefix += self._rbuf.getvalue()
+        self._rbuf = io.BytesIO(prefix)
+        return self._rbuf
+
+
 class Connection(object):
     """Wraps a Thrift session"""
 
@@ -147,7 +304,7 @@ class Connection(object):
         :param zookeeper_name_space: Use with service_mode='http' and is_zookeeper='true' only
         :param keytab_file: Use with service_mode='http' and auth='KERBEROS' only
         :param krb_conf: pycquery_krb.common.conf.KerberosConf instance. Use with service_mode='http' and auth='KERBEROS' only
-        :param timeout: http socket timeout (unit: ms)
+        :param timeout: socket timeout in ms (used for both binary and http)
 
         The way to support LDAP and GSSAPI is originated from cloudera/Impyla:
         https://github.com/cloudera/impyla/blob/255b07ed973d47a3395214ed92d35ec0615ebf62
@@ -232,36 +389,35 @@ class Connection(object):
                 if self.auth is None:
                     self.auth = 'NONE'
                 socket = thrift.transport.TSocket.TSocket(self.host, self.port)
+                if timeout is not None:
+                    socket.setTimeout(timeout)
                 if auth == 'NOSASL':
                     # NOSASL corresponds to hive.server2.authentication=NOSASL in hive-site.xml
                     self._transport = thrift.transport.TTransport.TBufferedTransport(socket)
                 elif self.auth in ('LDAP', 'KERBEROS', 'NONE', 'CUSTOM', 'NOSASL'):
-                    # Defer import so package dependency is optional
-                    import sasl
-                    import thrift_sasl
-
                     if self.auth == 'KERBEROS':
-                        # KERBEROS mode in hive.server2.authentication is GSSAPI in sasl library
-                        sasl_auth = 'GSSAPI'
+                        # Pure Python GSSAPI using pycquery_krb (e.g. Kyuubi thrift binary)
+                        buffered = thrift.transport.TTransport.TBufferedTransport(socket)
+                        self._transport = TKerberosSaslTransport(
+                            buffered,
+                            lambda payload=None: self._get_binary_kerberos_sasl_response(payload),
+                        )
                     else:
+                        # LDAP, NONE, CUSTOM: require sasl/thrift_sasl
+                        import sasl
+                        import thrift_sasl
                         sasl_auth = 'PLAIN'
                         if self.password is None:
-                            # Password doesn't matter in NONE mode, just needs to be nonempty.
                             self.password = 'x'
 
-                    def sasl_factory():
-                        sasl_client = sasl.Client()
-                        sasl_client.setAttr('host', self.host)
-                        if sasl_auth == 'GSSAPI':
-                            sasl_client.setAttr('service', self.kerberos_service_name)
-                        elif sasl_auth == 'PLAIN':
+                        def sasl_factory():
+                            sasl_client = sasl.Client()
+                            sasl_client.setAttr('host', self.host)
                             sasl_client.setAttr('username', username)
                             sasl_client.setAttr('password', password)
-                        else:
-                            raise AssertionError
-                        sasl_client.init()
-                        return sasl_client
-                    self._transport = thrift_sasl.TSaslClientTransport(sasl_factory, sasl_auth, socket)
+                            sasl_client.init()
+                            return sasl_client
+                        self._transport = thrift_sasl.TSaslClientTransport(sasl_factory, sasl_auth, socket)
 
                 else:
                     # All HS2 config options:
@@ -405,6 +561,95 @@ class Connection(object):
                 self._transport.setCustomHeaders(headers)
             finally:
                 self.auth_lock.release()
+
+    def _get_binary_kerberos_sasl_response(self, payload=None):
+        """Return SASL GSSAPI token: initial (AP-REQ) when payload is None, else challenge response."""
+        if payload is None or len(payload) == 0:
+            return self._get_binary_kerberos_token()
+        # RFC 4752 security layer: raw 4 octets from server.
+        if len(payload) == 4:
+            return struct.pack(">BI", 1, 0)[:4]
+        # 32-byte GSS wrap from server (security layer): reply with 32-byte no-conf token + COMPLETE (match Beeline pcap)
+        gss_api = getattr(self, '_binary_gss_api', None)
+        if gss_api is not None and len(payload) == 32 and payload[:2] == b'\x05\x04':
+            client_choice = struct.pack(">BI", 1, 0)[:4]
+            for seq in (0, 1):
+                try:
+                    token = gss_api.GSS_WrapNoConf(client_choice, seq)
+                    if len(token) != 32:
+                        continue
+                    return (token, True)  # send as COMPLETE
+                except Exception as e:
+                    _logger.debug(
+                        "GSS_Wrap for 32-byte challenge (seq=%s) failed: %s", seq, e
+                    )
+                    continue
+            _logger.warning(
+                "GSS_WrapNoConf for 32-byte challenge failed for both seq 0 and 1; "
+                "returning empty reply (server will likely reject)"
+            )
+            return b""
+        # RFC 4752 security layer: full GSS-wrapped. Try unwrap then wrap our choice (no layer).
+        if gss_api is not None and len(payload) >= 16 and payload[:2] == b'\x05\x04':
+            try:
+                t = GSSWrapToken.from_bytes(payload[:16])
+                ret2_len = 32 + t.RRC + t.EC
+                # Server may send only ret2 (no ret1) when plaintext is 4 bytes; then payload can be shorter.
+                if len(payload) >= ret2_len:
+                    auth_data = b'\x00' * 8 + payload[:ret2_len]
+                    data = payload[ret2_len:]
+                elif len(payload) > 16:
+                    # Treat full payload as ret2, no ret1 (e.g. 32-byte wrap for 4-octet security layer).
+                    auth_data = b'\x00' * 8 + payload
+                    data = b""
+                else:
+                    raise ValueError("payload too short")
+                plain = gss_api.GSS_Unwrap(data, 0, auth_data=auth_data)
+                if isinstance(plain, tuple):
+                    plain = plain[0]
+                if len(plain) >= 4:
+                    client_choice = struct.pack(">BI", 1, 0)[:4]
+                    r1, r2 = gss_api.GSS_Wrap(client_choice, 0, security_layer_response=True)
+                    return r2 + r1
+            except Exception as e:
+                _logger.debug("GSS Unwrap/Wrap for challenge failed: %s", e)
+                pass
+        # AP-REP or unknown: reply with empty.
+        return b""
+
+    def _get_binary_kerberos_token(self):
+        """Return raw GSSAPI initial context token (AP-REQ) for SASL handshake in binary mode."""
+        self.auth_lock.acquire()
+        try:
+            if self.kerb_client is None or self.expired_time < int(datetime.datetime.now().timestamp()):
+                if self.keytab_file:
+                    self.kerb_client, self.expired_time = self._get_krb_client_with_keytab(
+                        self.username, self.realm)
+                else:
+                    c_path = os.environ.get(_ENV_KRB5CCNAME, '')
+                    if not c_path:
+                        c_path = _get_krb5_config_value_with_variable(
+                            self.krb_conf.lib_defaults.default_ccache_name)
+                    if not c_path:
+                        raise IOError('The krb5 ticket cache does not exist.')
+                    self.kerb_client, self.expired_time = self._get_krb_client_with_ccache(
+                        self.username, self.realm, c_path)
+            spn = KerberosSPN()
+            # Use kerberos_service_name as-is when it already has a slash (e.g. lago-hive/lago);
+            # otherwise append /host for service/fqdn.
+            spn.service = (
+                self.kerberos_service_name
+                if self.kerberos_service_name.count('/') == 1
+                else self.kerberos_service_name + '/' + self.host
+            )
+            spn.domain = self.realm
+            tgs, enc, key = self.kerb_client.get_TGS(spn)
+            self._binary_gss_api = get_gssapi(key)
+            ap_req_bytes = self.kerb_client.construct_apreq(tgs=tgs, encTGSRepPart=enc, sessionkey=key, flags=0)
+            raw_token = GSSAPIOID('krb5').dump() + KRB5TokenTokID.KRB_AP_REQ.get_bytes() + ap_req_bytes
+            return GSSAPIToken(contents=raw_token).dump()
+        finally:
+            self.auth_lock.release()
 
     def _get_krb_client_with_keytab(self, user, realm):
         cred = KerberosCredential.from_keytab(self.keytab_file, user, realm)
