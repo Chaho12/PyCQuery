@@ -17,7 +17,7 @@ class PyTest(test_command):
 
 
 setup(
-    name='PyCQuery',
+    name='pycquery',
     version=pycquery.__version__,
     description='Python interface to Hive with pure-python Kerberos support',
     url='https://github.com/naver/PyCQuery',
